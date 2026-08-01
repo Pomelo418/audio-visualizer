@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mood Image Player</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --surface: #15171c;
+    --surface-2: #1c1f26;
+    --border: #262932;
+    --text: #eceef2;
+    --text-dim: #8b8f9b;
+    --accent: #6c7bff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 48px 20px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .app { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 20px; }
+  .eyebrow { text-align: center; font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); margin: 0; }
+
+  #stage {
+    position: relative;
+    height: 50vh;
+    overflow: hidden;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: #000;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.35);
+  }
+  .bg-layer {
+    position: absolute; inset: 0;
+    background-size: cover; background-position: center;
+    opacity: 0; transition: opacity 1.5s ease;
+  }
+  #stage::after { /* darken so controls/text stay readable */
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(180deg, rgba(0,0,0,0.05), rgba(0,0,0,0.55));
+  }
+
+  #nowPlaying { text-align: center; font-size: 14px; color: var(--text-dim); }
+
+  #controls { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+  button {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 10px 16px;
+    border-radius: 999px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease, color .15s ease;
+  }
+  button:hover { background: var(--surface-2); }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .search-row { display: flex; gap: 8px; }
+  #search {
+    flex: 1;
+    padding: 10px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color .15s ease;
+  }
+  #search:focus { border-color: var(--accent); }
+  #searchBtn { border-color: var(--accent); color: var(--accent); }
+  #searchBtn:hover { background: var(--accent); color: #fff; }
+
+  #results {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  #results:empty { display: none; }
+  #results li {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+    color: var(--text-dim);
+    transition: background .12s ease, color .12s ease;
+  }
+  #results li:last-child { border-bottom: none; }
+  #results li:hover { background: var(--surface-2); color: var(--text); }
+  .play-icon { opacity: 0; color: var(--accent); transition: opacity .12s ease; }
+  #results li:hover .play-icon { opacity: 1; }
+</style>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+<div class="app">
+  <div id="authBar" class="auth-bar"></div>
+  <p class="eyebrow">Mood Image Player</p>
+  <div id="stage">
+    <div class="bg-layer a"></div>
+    <div class="bg-layer b"></div>
+  </div>
+  <div id="nowPlaying">No track loaded</div>
+  <div id="controls">
+    <button id="playBtn">▶ Play / Pause</button>
+    <button id="loopBtn">🔁 Loop</button>
+    <button id="nextBtn">⏭ Next</button>
+  </div>
+  <div class="search-row">
+    <input id="search" placeholder="Search for a song..." />
+    <button id="searchBtn">Search</button>
+  </div>
+  <ul id="results"></ul>
+  <div id="playlistPanel"></div>
+</div>
+
+<audio id="audio"></audio>
+
+<script src="shared.js"></script>
+<script>
+// ---------- MusicAPI ----------
+const MusicAPI = {
+  async search(term, limit = 20) {
+    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&limit=${limit}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.results
+      .filter(r => r.previewUrl)
+      .map(r => ({
+        id: r.trackId,
+        title: r.trackName,
+        artist: r.artistName,
+        genre: r.primaryGenreName,
+        previewUrl: r.previewUrl,
+      }));
+  },
+};
+
+// ---------- ImageVisualizer ----------
+// Maps iTunes genre names to mood keywords used to fetch fitting background photos.
+// loremflickr.com serves free, keyword-tagged random photos with no API key required.
+const GENRE_VIBES = {
+  'Pop': ['colorful confetti', 'party lights', 'sunset beach', 'bright neon sign', 'pastel clouds'],
+  'Dance': ['neon lights', 'laser show', 'nightclub crowd', 'strobe light', 'glow sticks'],
+  'Electronic': ['neon grid', 'futuristic city', 'cyberpunk street', 'synthwave sunset', 'led lights'],
+  'House': ['nightclub lights', 'dj booth', 'warehouse party', 'neon dance floor'],
+  'Techno': ['industrial warehouse', 'strobe lights', 'concrete tunnel', 'neon fog'],
+  'Hip-Hop/Rap': ['urban night', 'city skyline', 'street art', 'graffiti wall', 'basketball court night'],
+  'R&B/Soul': ['candlelight', 'velvet lounge', 'golden hour', 'silhouette sunset', 'city lights bokeh'],
+  'Rock': ['electric guitar', 'concert crowd', 'stage lights', 'open highway', 'motorcycle sunset'],
+  'Alternative': ['moody city', 'rain window', 'foggy street', 'neon alley', 'overcast skyline'],
+  'Punk': ['graffiti alley', 'leather jacket', 'concert mosh pit', 'spray paint wall'],
+  'Metal': ['storm clouds', 'lightning strike', 'dark forest', 'volcano smoke', 'iron chains'],
+  'Folk': ['mountain forest', 'campfire night', 'autumn trail', 'wooden cabin', 'wildflower field'],
+  'Country': ['open road', 'wheat field sunset', 'barn silhouette', 'pickup truck dust', 'cowboy boots'],
+  'Singer/Songwriter': ['coffee shop window', 'acoustic guitar', 'cozy bedroom light', 'notebook candle'],
+  'Blues': ['old bar neon', 'vinyl record', 'misty river', 'smoky room', 'harmonica silhouette'],
+  'Jazz': ['smoky lounge', 'vintage piano', 'rainy city street', 'saxophone silhouette', 'candlelit bar'],
+  'Classical': ['grand concert hall', 'orchestra stage', 'marble architecture', 'violin closeup', 'chandelier ceiling'],
+  'Opera': ['velvet theater curtain', 'grand chandelier', 'baroque architecture'],
+  'Vocal': ['spotlight stage', 'microphone closeup', 'velvet curtain'],
+  'Latin': ['carnival colors', 'tropical beach sunset', 'salsa dance', 'colorful street market'],
+  'Reggae': ['palm trees', 'ocean sunset', 'island beach', 'rasta colors'],
+  'Reggaeton': ['neon palm trees', 'tropical nightclub', 'beach party lights'],
+  'World': ['desert dunes', 'ancient temple', 'lantern festival', 'mountain village', 'spice market'],
+  'Soundtrack': ['epic landscape', 'cinematic fog', 'dramatic sky', 'mountain vista', 'stormy horizon'],
+  'New Age': ['aurora borealis', 'zen garden', 'misty forest', 'starry meditation sky'],
+  'Ambient': ['foggy mountains', 'slow clouds', 'deep space stars', 'calm ocean horizon'],
+  'Christian & Gospel': ['church stained glass', 'sunrise clouds', 'golden light rays', 'choir silhouette'],
+  'K-Pop': ['neon street fashion', 'colorful lights', 'city night bokeh', 'pastel aesthetic'],
+  'J-Pop': ['tokyo neon street', 'cherry blossom', 'city lights night'],
+  'Anime': ['cherry blossom sky', 'neon tokyo street', 'anime style clouds'],
+  "Children's Music": ['rainbow balloons', 'colorful playground', 'sunny meadow', 'cartoon clouds'],
+  'Holiday': ['string lights snow', 'fireplace glow', 'winter market lights', 'snowy pine forest'],
+  'Comedy': ['bright stage spotlight', 'colorful confetti', 'playful neon sign'],
+  'Fitness & Workout': ['sunrise running trail', 'gym neon lights', 'energetic city run'],
+  'Easy Listening': ['calm sunset beach', 'soft pastel clouds', 'quiet lakeside'],
+  'Instrumental': ['piano keys closeup', 'violin silhouette', 'concert hall lights'],
+  'Spoken Word': ['dim stage microphone', 'bookshelf candlelight', 'typewriter desk'],
+  default: ['abstract color', 'aurora sky', 'starry night', 'colorful smoke'],
+};
+
+const ImageVisualizer = {
+  layers: [],
+  activeLayer: 0,
+  intervalId: null,
+  keywordPool: GENRE_VIBES.default,
+
+  init(stageEl) {
+    this.layers = [stageEl.querySelector('.bg-layer.a'), stageEl.querySelector('.bg-layer.b')];
+  },
+
+  setTrack(track) {
+    this.keywordPool = GENRE_VIBES[track.genre] || GENRE_VIBES.default;
+    this._showNext(); // show a matching image immediately instead of waiting 5s
+  },
+
+  start() {
+    if (this.intervalId) return;
+    this.intervalId = setInterval(() => this._showNext(), 5000);
+  },
+
+  stop() {
+    clearInterval(this.intervalId);
+    this.intervalId = null;
+  },
+
+  _showNext(attempt = 0) {
+    if (attempt >= 4) return; // loremflickr is flaky for some tags — after a few tries, just leave the current image up
+    const keyword = this.keywordPool[Math.floor(Math.random() * this.keywordPool.length)];
+    const tags = keyword.split(' ').map(encodeURIComponent).join(','); // loremflickr wants comma-separated tags, not %20-encoded phrases
+    const url = `https://loremflickr.com/1600/900/${tags}?random=${Date.now()}`;
+    const nextIndex = 1 - this.activeLayer;
+
+    const preload = new Image();
+    preload.onload = () => {
+      this.layers[nextIndex].style.backgroundImage = `url(${url})`;
+      this.layers[nextIndex].style.opacity = 1;
+      this.layers[this.activeLayer].style.opacity = 0;
+      this.activeLayer = nextIndex;
+    };
+    // loremflickr intermittently 500s on specific tags (confirmed externally, not something we control) —
+    // retry with a freshly-picked keyword rather than leaving the background stuck blank.
+    preload.onerror = () => this._showNext(attempt + 1);
+    preload.src = url;
+  },
+};
+
+// ---------- Player ----------
+const Player = {
+  audioEl: null, queue: [], currentIndex: -1, isLooping: false, wrapAround: false, currentPlaylistId: null,
+  init(audioEl) {
+    this.audioEl = audioEl;
+    // native .loop handles the restart internally as one continuous playback session —
+    // manually resetting currentTime + calling play() from the 'ended' handler counts as a
+    // *new* programmatic play, which autoplay policies only allow once after the user's click.
+    this.audioEl.addEventListener('ended', () => this.next());
+  },
+  loadQueue(tracks, startIndex = 0, { wrapAround = false, playlistId = null } = {}) {
+    this.queue = tracks;
+    this.wrapAround = wrapAround;
+    this.currentPlaylistId = playlistId;
+    this.playAt(startIndex);
+  },
+  appendToQueue(track) { this.queue.push(track); },
+  playAt(index) {
+    if (index < 0 || index >= this.queue.length) return;
+    this.currentIndex = index;
+    const track = this.queue[index];
+    this.audioEl.src = track.previewUrl;
+    this.audioEl.play();
+    ImageVisualizer.setTrack(track);
+    ImageVisualizer.start();
+    this._onTrackChange?.(track);
+  },
+  togglePlay() {
+    if (!this.audioEl.src) return;
+    if (this.audioEl.ended) { this.playAt(this.currentIndex); return; } // resuming a finished clip needs a restart, not play()
+    if (this.audioEl.paused) { this.audioEl.play(); ImageVisualizer.start(); }
+    else { this.audioEl.pause(); ImageVisualizer.stop(); }
+  },
+  toggleLoop() {
+    this.isLooping = !this.isLooping;
+    this.audioEl.loop = this.isLooping;
+    return this.isLooping;
+  },
+  next() {
+    const n = this.currentIndex + 1;
+    if (n < this.queue.length) this.playAt(n);
+    else if (this.wrapAround) this.playAt(0);
+    else ImageVisualizer.stop();
+  },
+  onTrackChange(cb) { this._onTrackChange = cb; },
+};
+
+// ---------- Wire up UI ----------
+const audioEl = document.getElementById('audio');
+ImageVisualizer.init(document.getElementById('stage'));
+Player.init(audioEl);
+Player.onTrackChange(t => {
+  document.getElementById('nowPlaying').textContent = `Now playing: ${t.title} — ${t.artist} ${t.genre ? `(${t.genre})` : ''}`;
+});
+
+initAuthUI(document.getElementById('authBar'));
+initPlaylistPanel(document.getElementById('playlistPanel'), {
+  onPlay: (tracks, startIndex = 0, playlistId = null) => Player.loadQueue(tracks, startIndex, { wrapAround: true, playlistId }),
+});
+
+document.getElementById('playBtn').onclick = () => Player.togglePlay();
+document.getElementById('nextBtn').onclick = () => Player.next();
+document.getElementById('loopBtn').onclick = (e) => {
+  const active = Player.toggleLoop();
+  e.target.classList.toggle('active', active);
+};
+
+document.getElementById('searchBtn').onclick = doSearch;
+document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+document.getElementById('search').addEventListener('input', e => {
+  if (!e.target.value.trim()) document.getElementById('results').innerHTML = '';
+});
+
+async function doSearch() {
+  const term = document.getElementById('search').value.trim();
+  if (!term) return;
+  const results = await MusicAPI.search(term);
+  const list = document.getElementById('results');
+  list.innerHTML = '';
+  results.forEach((track, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${track.title} — ${track.artist}</span>`;
+    li.onclick = () => Player.loadQueue(results, i);
+    const right = document.createElement('span');
+    right.style.display = 'flex';
+    right.style.alignItems = 'center';
+    right.style.gap = '8px';
+    right.appendChild(renderAddToPlaylistButton(track));
+    const playIcon = document.createElement('span');
+    playIcon.className = 'play-icon';
+    playIcon.textContent = '▶';
+    right.appendChild(playIcon);
+    li.appendChild(right);
+    list.appendChild(li);
+  });
+}
+</script>
+</body>
+</html>

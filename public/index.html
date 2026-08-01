@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Audio Reactive Player</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --surface: #15171c;
+    --surface-2: #1c1f26;
+    --border: #262932;
+    --text: #eceef2;
+    --text-dim: #8b8f9b;
+    --accent: #6c7bff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 48px 20px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .app { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 20px; }
+  .eyebrow { text-align: center; font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); margin: 0; }
+
+  .stage {
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    box-shadow: 0 24px 60px rgba(0,0,0,0.35);
+  }
+  #canvas { width: 100%; height: 50vh; display: block; }
+
+  #nowPlaying { text-align: center; font-size: 14px; color: var(--text-dim); }
+
+  #controls { display: flex; justify-content: center; gap: 10px; flex-wrap: wrap; }
+  button {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 10px 16px;
+    border-radius: 999px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background .15s ease, border-color .15s ease, color .15s ease;
+  }
+  button:hover { background: var(--surface-2); }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .search-row { display: flex; gap: 8px; }
+  #search {
+    flex: 1;
+    padding: 10px 16px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color .15s ease;
+  }
+  #search:focus { border-color: var(--accent); }
+  #searchBtn { border-color: var(--accent); color: var(--accent); }
+  #searchBtn:hover { background: var(--accent); color: #fff; }
+
+  #results {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  #results:empty { display: none; }
+  #results li {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+    color: var(--text-dim);
+    transition: background .12s ease, color .12s ease;
+  }
+  #results li:last-child { border-bottom: none; }
+  #results li:hover { background: var(--surface-2); color: var(--text); }
+  .play-icon { opacity: 0; color: var(--accent); transition: opacity .12s ease; }
+  #results li:hover .play-icon { opacity: 1; }
+</style>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+<div class="app">
+  <div id="authBar" class="auth-bar"></div>
+  <p class="eyebrow">Audio Visualizer</p>
+  <div class="stage"><canvas id="canvas"></canvas></div>
+  <div id="nowPlaying">No track loaded</div>
+  <div id="controls">
+    <button id="playBtn">▶ Play / Pause</button>
+    <button id="loopBtn">🔁 Loop</button>
+    <button id="nextBtn">⏭ Next</button>
+  </div>
+  <div class="search-row">
+    <input id="search" placeholder="Search for a song..." />
+    <button id="searchBtn">Search</button>
+  </div>
+  <ul id="results"></ul>
+  <div id="playlistPanel"></div>
+</div>
+
+<audio id="audio" crossorigin="anonymous"></audio>
+
+<script src="shared.js"></script>
+<script>
+// ---------- MusicAPI ----------
+const MusicAPI = {
+  async search(term, limit = 20) {
+    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&limit=${limit}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.results
+      .filter(r => r.previewUrl)
+      .map(r => ({ id: r.trackId, title: r.trackName, artist: r.artistName, previewUrl: r.previewUrl }));
+  },
+};
+
+// ---------- AudioEngine ----------
+const AudioEngine = {
+  ctx: null, analyser: null, sourceNode: null, freqData: null, timeData: null,
+  init(audioEl) {
+    if (this.ctx) return;
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 256;
+    this.analyser.smoothingTimeConstant = 0.8;
+    this.sourceNode = this.ctx.createMediaElementSource(audioEl);
+    this.sourceNode.connect(this.analyser);
+    this.analyser.connect(this.ctx.destination);
+    this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
+    this.timeData = new Uint8Array(this.analyser.frequencyBinCount);
+  },
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); },
+  getFrequencyData() { this.analyser.getByteFrequencyData(this.freqData); return this.freqData; },
+  getWaveformData() { this.analyser.getByteTimeDomainData(this.timeData); return this.timeData; },
+};
+
+// ---------- LyricsAPI ----------
+// lrclib.net is free, keyless, and CORS-enabled. Lyrics are for the FULL track though,
+// while we only ever play a 30-60s preview clip, so there's no reliable offset to sync
+// against — we just cycle through the lines rather than claiming word-accurate timing.
+const LyricsAPI = {
+  async fetchLines(track) {
+    try {
+      const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(track.title)}&artist_name=${encodeURIComponent(track.artist)}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      const match = data.find(r => r.plainLyrics) || data[0];
+      if (!match?.plainLyrics) return null;
+      return match.plainLyrics.split('\n').map(l => l.trim()).filter(Boolean);
+    } catch {
+      return null;
+    }
+  },
+};
+
+// ---------- Visualizer (particles that assemble into the current lyric line) ----------
+const PARTICLE_COUNT = 1400;
+const LINE_INTERVAL_MS = 4000;
+
+const Visualizer = {
+  canvas: null, ctx: null, offCanvas: null, offCtx: null,
+  particles: [], rafId: null, lyricInterval: null, lines: [], lineIndex: 0,
+
+  init(canvasEl) {
+    this.canvas = canvasEl;
+    this.ctx = canvasEl.getContext('2d');
+    this.offCanvas = document.createElement('canvas');
+    this.offCtx = this.offCanvas.getContext('2d');
+    this._resize();
+    window.addEventListener('resize', () => this._resize());
+    this.particles = Array.from({ length: PARTICLE_COUNT }, (_, i) => ({
+      x: Math.random() * this.canvas.width,
+      y: Math.random() * this.canvas.height,
+      tx: 0, ty: 0,
+      freqIndex: i % 128, // reuse the 128 analyser bins across however many particles we have
+    }));
+  },
+
+  _resize() {
+    this.canvas.width = this.canvas.clientWidth * devicePixelRatio;
+    this.canvas.height = this.canvas.clientHeight * devicePixelRatio;
+    this.offCanvas.width = this.canvas.width;
+    this.offCanvas.height = this.canvas.height;
+  },
+
+  // Renders `text` off-screen and samples the opaque pixels as particle target points.
+  _samplePoints(text) {
+    const { offCtx, offCanvas } = this;
+    offCtx.clearRect(0, 0, offCanvas.width, offCanvas.height);
+    offCtx.fillStyle = '#fff';
+    offCtx.textAlign = 'center';
+    offCtx.textBaseline = 'middle';
+
+    let fontSize = offCanvas.height * 0.16;
+    offCtx.font = `bold ${fontSize}px sans-serif`;
+    while (offCtx.measureText(text).width > offCanvas.width * 0.9 && fontSize > 10) {
+      fontSize -= 2;
+      offCtx.font = `bold ${fontSize}px sans-serif`;
+    }
+    offCtx.fillText(text, offCanvas.width / 2, offCanvas.height / 2);
+
+    const { data } = offCtx.getImageData(0, 0, offCanvas.width, offCanvas.height);
+    const step = 4;
+    const points = [];
+    for (let y = 0; y < offCanvas.height; y += step) {
+      for (let x = 0; x < offCanvas.width; x += step) {
+        if (data[(y * offCanvas.width + x) * 4 + 3] > 128) points.push({ x, y });
+      }
+    }
+    return points;
+  },
+
+  setLine(text) {
+    const points = this._samplePoints(text);
+    if (points.length === 0) return;
+    for (let i = points.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [points[i], points[j]] = [points[j], points[i]];
+    }
+    this.particles.forEach((p, i) => {
+      const pt = points[i % points.length];
+      p.tx = pt.x;
+      p.ty = pt.y;
+    });
+  },
+
+  startLyricCycle(lines) {
+    clearInterval(this.lyricInterval);
+    this.lines = lines?.length ? lines : ['♪'];
+    this.lineIndex = 0;
+    this.setLine(this.lines[0]);
+    this.lyricInterval = setInterval(() => {
+      this.lineIndex = (this.lineIndex + 1) % this.lines.length;
+      this.setLine(this.lines[this.lineIndex]);
+    }, LINE_INTERVAL_MS);
+  },
+
+  start() {
+    if (this.rafId) return;
+    const loop = () => { this._draw(); this.rafId = requestAnimationFrame(loop); };
+    loop();
+  },
+  pause() { cancelAnimationFrame(this.rafId); this.rafId = null; },
+  stop() { this.pause(); clearInterval(this.lyricInterval); this.lyricInterval = null; },
+
+  _draw() {
+    const { ctx, canvas } = this;
+    ctx.fillStyle = 'rgba(10,10,20,0.25)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const freq = AudioEngine.getFrequencyData();
+    this.particles.forEach((p, i) => {
+      const amp = freq[p.freqIndex] / 255;
+      p.x += (p.tx - p.x) * 0.08 + (Math.random() - 0.5) * amp * 4;
+      p.y += (p.ty - p.y) * 0.08 + (Math.random() - 0.5) * amp * 4;
+
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 1.5 + amp * 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `hsl(${(i / this.particles.length) * 360}, 90%, ${55 + amp * 25}%)`;
+      ctx.fill();
+    });
+  },
+};
+
+// ---------- Player ----------
+const Player = {
+  audioEl: null, queue: [], currentIndex: -1, isLooping: false, wrapAround: false, currentPlaylistId: null,
+  init(audioEl) {
+    this.audioEl = audioEl;
+    this.audioEl.addEventListener('ended', () => {
+      if (this.isLooping) { this.audioEl.currentTime = 0; this.audioEl.play(); }
+      else this.next();
+    });
+  },
+  loadQueue(tracks, startIndex = 0, { wrapAround = false, playlistId = null } = {}) {
+    this.queue = tracks;
+    this.wrapAround = wrapAround;
+    this.currentPlaylistId = playlistId;
+    this.playAt(startIndex);
+  },
+  appendToQueue(track) { this.queue.push(track); },
+  playAt(index) {
+    if (index < 0 || index >= this.queue.length) return;
+    this.currentIndex = index;
+    const track = this.queue[index];
+    this.audioEl.src = track.previewUrl;
+    AudioEngine.init(this.audioEl);
+    AudioEngine.resume();
+    this.audioEl.play();
+    Visualizer.start();
+    this._onTrackChange?.(track);
+  },
+  togglePlay() {
+    if (!this.audioEl.src) return;
+    AudioEngine.resume();
+    if (this.audioEl.paused) { this.audioEl.play(); Visualizer.start(); }
+    else this.audioEl.pause();
+  },
+  toggleLoop() { this.isLooping = !this.isLooping; return this.isLooping; },
+  next() {
+    const n = this.currentIndex + 1;
+    if (n < this.queue.length) this.playAt(n);
+    else if (this.wrapAround) this.playAt(0);
+    else Visualizer.stop();
+  },
+  onTrackChange(cb) { this._onTrackChange = cb; },
+};
+
+// ---------- Wire up UI ----------
+const audioEl = document.getElementById('audio');
+Visualizer.init(document.getElementById('canvas'));
+Player.init(audioEl);
+Player.onTrackChange(t => {
+  document.getElementById('nowPlaying').textContent = `Now playing: ${t.title} — ${t.artist}`;
+});
+
+initAuthUI(document.getElementById('authBar'));
+initPlaylistPanel(document.getElementById('playlistPanel'), {
+  onPlay: (tracks, startIndex = 0, playlistId = null) => Player.loadQueue(tracks, startIndex, { wrapAround: true, playlistId }),
+});
+
+document.getElementById('playBtn').onclick = () => Player.togglePlay();
+document.getElementById('nextBtn').onclick = () => Player.next();
+document.getElementById('loopBtn').onclick = (e) => {
+  const active = Player.toggleLoop();
+  e.target.classList.toggle('active', active);
+};
+
+document.getElementById('searchBtn').onclick = doSearch;
+document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+document.getElementById('search').addEventListener('input', e => {
+  if (!e.target.value.trim()) document.getElementById('results').innerHTML = '';
+});
+
+async function doSearch() {
+  const term = document.getElementById('search').value.trim();
+  if (!term) return;
+  const results = await MusicAPI.search(term);
+  const list = document.getElementById('results');
+  list.innerHTML = '';
+  results.forEach((track, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${track.title} — ${track.artist}</span>`;
+    li.onclick = () => Player.loadQueue(results, i);
+    const right = document.createElement('span');
+    right.style.display = 'flex';
+    right.style.alignItems = 'center';
+    right.style.gap = '8px';
+    right.appendChild(renderAddToPlaylistButton(track));
+    const playIcon = document.createElement('span');
+    playIcon.className = 'play-icon';
+    playIcon.textContent = '▶';
+    right.appendChild(playIcon);
+    li.appendChild(right);
+    list.appendChild(li);
+  });
+}
+</script>
+</body>
+</html>
